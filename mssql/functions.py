@@ -7,10 +7,12 @@ from django import VERSION
 from django.core import validators
 from django.db import NotSupportedError, connections, transaction
 from django.db.models import BooleanField, CheckConstraint, Value
-from django.db.models.expressions import Case, Exists, Expression, OrderBy, When, Window
+from django.db.models.expressions import Case, Exists, OrderBy, When, Window
 from django.db.models.fields import BinaryField, Field
 from django.db.models.functions import Cast, NthValue, MD5, SHA1, SHA224, SHA256, SHA384, SHA512
+from django.db.models.functions.datetime import Now
 from django.db.models.functions.math import ATan2, Ln, Log, Mod, Round, Degrees, Radians, Power
+from django.db.models.functions.text import Replace
 from django.db.models.lookups import In, Lookup
 from django.db.models.query import QuerySet
 from django.db.models.sql.query import Query
@@ -24,11 +26,22 @@ if VERSION >= (3, 2):
     from django.db.models.functions.math import Random
 
 DJANGO3 = VERSION[0] >= 3
+DJANGO41 = VERSION >= (4, 1)
 
 
 class TryCast(Cast):
     function = 'TRY_CAST'
 
+def sqlserver_cast(self, compiler, connection, **extra_context):
+    if hasattr(self.source_expressions[0], 'lookup_name'):
+        if self.source_expressions[0].lookup_name in ['gt', 'gte', 'lt', 'lte']:
+            return self.as_sql(
+                compiler, connection,
+                template = 'CASE WHEN %(expressions)s THEN 1 ELSE 0 END',
+                **extra_context
+            )
+    return self.as_sql(compiler, connection, **extra_context)
+    
 
 def sqlserver_atan2(self, compiler, connection, **extra_context):
     return self.as_sql(compiler, connection, function='ATN2', **extra_context)
@@ -42,6 +55,19 @@ def sqlserver_log(self, compiler, connection, **extra_context):
 
 def sqlserver_ln(self, compiler, connection, **extra_context):
     return self.as_sql(compiler, connection, function='LOG', **extra_context)
+
+
+def sqlserver_replace(self, compiler, connection, **extra_context):
+    current_db = "CONVERT(varchar, (SELECT DB_NAME()))"
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT CONVERT(varchar, DATABASEPROPERTYEX(%s, 'collation'))" % current_db)
+        default_collation = cursor.fetchone()[0]
+    current_collation = default_collation.replace('_CI', '_CS')
+    return self.as_sql(
+            compiler, connection, function='REPLACE',
+            template = 'REPLACE(%s COLLATE %s)' % ('%(expressions)s', current_collation),
+            **extra_context
+        )
 
 def sqlserver_degrees(self, compiler, connection, **extra_context):
     return self.as_sql(
@@ -95,7 +121,7 @@ def sqlserver_random(self, compiler, connection, **extra_context):
 
 def sqlserver_window(self, compiler, connection, template=None):
     # MSSQL window functions require an OVER clause with ORDER BY
-    if self.order_by is None:
+    if VERSION < (4, 1) and self.order_by is None:
         self.order_by = Value('SELECT NULL')
     return self.as_sql(compiler, connection, template)
 
@@ -108,6 +134,10 @@ def sqlserver_exists(self, compiler, connection, template=None, **extra_context)
     sql = 'CASE WHEN {} THEN 1 ELSE 0 END'.format(sql)
     return sql, params
 
+def sqlserver_now(self, compiler, connection, **extra_context):
+        return self.as_sql(
+            compiler, connection, template="SYSDATETIME()", **extra_context
+        )
 
 def sqlserver_lookup(self, compiler, connection):
     # MSSQL doesn't allow EXISTS() to be compared to another expression
@@ -166,8 +196,8 @@ def mssql_split_parameter_list_as_sql(self, compiler, connection):
         cursor.execute(f"CREATE TABLE #Temp_params (params {parameter_data_type} {Temp_table_collation})")
         for offset in range(0, len(rhs_params), 1000):
             sqls_params = rhs_params[offset: offset + 1000]
-            sqls_params = ", ".join("('{}')".format(item) for item in sqls_params)
-            cursor.execute("INSERT INTO #Temp_params VALUES %s" % sqls_params)
+            sql = "INSERT INTO [#Temp_params] ([params]) VALUES " + ', '.join(['(%s)'] * len(sqls_params))
+            cursor.execute(sql, sqls_params)
 
     in_clause = lhs + ' IN ' + '(SELECT params from #Temp_params)'
 
@@ -204,8 +234,11 @@ def json_HasKeyLookup(self, compiler, connection):
     else:
         lhs, _ = self.process_lhs(compiler, connection)
         lhs_json_path = '$'
-    sql = lhs + ' IN (SELECT ' + lhs + ' FROM ' + self.lhs.output_field.model._meta.db_table + \
-    ' CROSS APPLY OPENJSON(' + lhs + ') WITH ( [json_path_value] char(1) \'%s\') WHERE [json_path_value] IS NOT NULL)'
+    if connection.sql_server_version >= 2022:
+        sql = "JSON_PATH_EXISTS(%s, '%%s') > 0" % lhs
+    else:
+        sql = lhs + ' IN (SELECT ' + lhs + ' FROM ' + self.lhs.output_field.model._meta.db_table + \
+        ' CROSS APPLY OPENJSON(' + lhs + ') WITH ( [json_path_value] char(1) \'%s\') WHERE [json_path_value] IS NOT NULL)'
     # Process JSON path from the right-hand side.
     rhs = self.rhs
     rhs_params = []
@@ -216,7 +249,13 @@ def json_HasKeyLookup(self, compiler, connection):
             *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
         else:
             rhs_key_transforms = [key]
-        rhs_params.append('%s%s' % (
+        if VERSION >= (4, 1):
+            *rhs_key_transforms, final_key = rhs_key_transforms
+            rhs_json_path = compile_json_path(rhs_key_transforms, include_root=False)
+            rhs_json_path += self.compile_json_path_final_key(final_key)
+            rhs_params.append(lhs_json_path + rhs_json_path)
+        else:
+            rhs_params.append('%s%s' % (
             lhs_json_path,
             compile_json_path(rhs_key_transforms, include_root=False),
         ))
@@ -255,7 +294,7 @@ def _get_check_sql(self, model, schema_editor):
     return sql % tuple(schema_editor.quote_value(p) for p in params)
 
 
-def bulk_update_with_default(self, objs, fields, batch_size=None, default=0):
+def bulk_update_with_default(self, objs, fields, batch_size=None, default=None):
     """
         Update the given fields in each of the given objects in the database.
 
@@ -263,7 +302,7 @@ def bulk_update_with_default(self, objs, fields, batch_size=None, default=0):
         SQL Server require that at least one of the result expressions in a CASE specification must be an expression other than the NULL constant.
         Patched with a default value 0. The user can also pass a custom default value for CASE statement.
     """
-    if batch_size is not None and batch_size < 0:
+    if batch_size is not None and batch_size <= 0:
         raise ValueError('Batch size must be a positive integer.')
     if not fields:
         raise ValueError('Field names must be given to bulk_update().')
@@ -277,11 +316,18 @@ def bulk_update_with_default(self, objs, fields, batch_size=None, default=0):
         raise ValueError('bulk_update() cannot be used with primary key fields.')
     if not objs:
         return 0
+    if DJANGO41:
+        for obj in objs:
+            obj._prepare_related_fields_for_save(
+                operation_name="bulk_update", fields=fields
+            )
     # PK is used twice in the resulting update query, once in the filter
     # and once in the WHEN. Each field will also have one CAST.
-    max_batch_size = connections[self.db].ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
+    self._for_write = True
+    connection = connections[self.db]
+    max_batch_size = connection.ops.bulk_batch_size(['pk', 'pk'] + fields, objs)
     batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
-    requires_casting = connections[self.db].features.requires_casted_case_in_updates
+    requires_casting = connection.features.requires_casted_case_in_updates
     batches = (objs[i:i + batch_size] for i in range(0, len(objs), batch_size))
     updates = []
     for batch_objs in batches:
@@ -291,13 +337,14 @@ def bulk_update_with_default(self, objs, fields, batch_size=None, default=0):
             when_statements = []
             for obj in batch_objs:
                 attr = getattr(obj, field.attname)
-                if not isinstance(attr, Expression):
+                if not hasattr(attr, "resolve_expression"):
                     if attr is None:
                         value_none_counter += 1
                     attr = Value(attr, output_field=field)
                 when_statements.append(When(pk=obj.pk, then=attr))
-            if connections[self.db].vendor == 'microsoft' and value_none_counter == len(when_statements):
-                case_statement = Case(*when_statements, output_field=field, default=Value(default))
+            if connection.vendor == 'microsoft' and value_none_counter == len(when_statements):
+                # We don't need a case statement if we are setting everything to None
+                case_statement = Value(None)
             else:
                 case_statement = Case(*when_statements, output_field=field)
             if requires_casting:
@@ -305,9 +352,10 @@ def bulk_update_with_default(self, objs, fields, batch_size=None, default=0):
             update_kwargs[field.attname] = case_statement
         updates.append(([obj.pk for obj in batch_objs], update_kwargs))
     rows_updated = 0
+    queryset = self.using(self.db)
     with transaction.atomic(using=self.db, savepoint=False):
         for pks, update_kwargs in updates:
-            rows_updated += self.filter(pk__in=pks).update(**update_kwargs)
+            rows_updated += queryset.filter(pk__in=pks).update(**update_kwargs)
     return rows_updated
 
 
@@ -414,6 +462,7 @@ if VERSION >= (3, 1):
     key_transform_exact_process_rhs = KeyTransformExact.process_rhs
     KeyTransformExact.process_rhs = json_KeyTransformExact_process_rhs
     HasKeyLookup.as_microsoft = json_HasKeyLookup
+Cast.as_microsoft = sqlserver_cast
 Degrees.as_microsoft = sqlserver_degrees
 Radians.as_microsoft = sqlserver_radians
 Power.as_microsoft = sqlserver_power
@@ -423,6 +472,8 @@ Mod.as_microsoft = sqlserver_mod
 NthValue.as_microsoft = sqlserver_nth_value
 Round.as_microsoft = sqlserver_round
 Window.as_microsoft = sqlserver_window
+Replace.as_microsoft = sqlserver_replace
+Now.as_microsoft = sqlserver_now
 MD5.as_microsoft = sqlserver_md5
 SHA1.as_microsoft = sqlserver_sha1
 SHA224.as_microsoft = sqlserver_sha224

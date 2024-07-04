@@ -6,6 +6,7 @@ from django.utils.functional import cached_property
 
 
 class DatabaseFeatures(BaseDatabaseFeatures):
+    allows_group_by_select_index = False
     allow_sliced_subqueries_with_in = False
     can_introspect_autofield = True
     can_introspect_json_field = False
@@ -17,6 +18,7 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     can_use_chunked_reads = False
     for_update_after_from = True
     greatest_least_ignores_nulls = True
+    has_case_insensitive_like = True
     has_json_object_function = False
     has_json_operators = False
     has_native_json_field = False
@@ -31,6 +33,8 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     requires_literal_defaults = True
     requires_sqlparse_for_splitting = False
     supports_boolean_expr_in_select_clause = False
+    supports_comparing_boolean_expr = False
+    supports_comments = True
     supports_covering_indexes = True
     supports_deferrable_unique_constraints = False
     supports_expression_indexes = False
@@ -54,6 +58,12 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     supports_partially_nullable_unique_constraints = True
     supports_partial_indexes = True
     supports_functions_in_partial_indexes = True
+    supports_default_keyword_in_insert = True
+    supports_expression_defaults = True
+    supports_default_keyword_in_bulk_insert = True
+    supports_stored_generated_columns = True
+    supports_virtual_generated_columns = True
+
 
     @cached_property
     def has_zoneinfo_database(self):
@@ -64,3 +74,10 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     @cached_property
     def supports_json_field(self):
         return self.connection.sql_server_version >= 2016 or self.connection.to_azure_sql_db
+
+    @cached_property
+    def introspected_field_types(self):
+        return {
+            **super().introspected_field_types,
+            "DurationField": "BigIntegerField",
+        }

@@ -6,7 +6,7 @@ from itertools import chain
 
 import django
 from django.db.models.aggregates import Avg, Count, StdDev, Variance
-from django.db.models.expressions import Ref, Subquery, Value
+from django.db.models.expressions import Ref, Subquery, Value, Window
 from django.db.models.functions import (
     Chr, ConcatPair, Greatest, Least, Length, LPad, Random, Repeat, RPad, StrIndex, Substr, Trim
 )
@@ -15,6 +15,8 @@ from django.db.transaction import TransactionManagementError
 from django.db.utils import NotSupportedError
 if django.VERSION >= (3, 1):
     from django.db.models.fields.json import compile_json_path, KeyTransform as json_KeyTransform
+if django.VERSION >= (4, 2):
+    from django.core.exceptions import EmptyResultSet, FullResultSet
 
 def _as_sql_agv(self, compiler, connection):
     return self.as_sql(compiler, connection, template='%(function)s(CONVERT(float, %(field)s))')
@@ -76,8 +78,9 @@ def _as_sql_lpad(self, compiler, connection):
     params.extend(length_arg)
     params.extend(expression_arg)
     params.extend(expression_arg)
-    template = ('LEFT(REPLICATE(%(fill_text)s, %(length)s), CASE WHEN %(length)s > LEN(%(expression)s) '
-                'THEN %(length)s - LEN(%(expression)s) ELSE 0 END) + %(expression)s')
+    params.extend(length_arg)
+    template = ('LEFT(LEFT(REPLICATE(%(fill_text)s, %(length)s), CASE WHEN %(length)s > LEN(%(expression)s) '
+                'THEN %(length)s - LEN(%(expression)s) ELSE 0 END) + %(expression)s, %(length)s)')
     return template % {'expression': expression, 'length': length, 'fill_text': fill_text}, params
 
 
@@ -129,6 +132,41 @@ def _as_sql_variance(self, compiler, connection):
         function = '%sP' % function
     return self.as_sql(compiler, connection, function=function)
 
+def _as_sql_window(self, compiler, connection, template=None):
+    connection.ops.check_expression_support(self)
+    if not connection.features.supports_over_clause:
+        raise NotSupportedError("This backend does not support window expressions.")
+    expr_sql, params = compiler.compile(self.source_expression)
+    window_sql, window_params = [], ()
+
+    if self.partition_by is not None:
+        sql_expr, sql_params = self.partition_by.as_sql(
+            compiler=compiler,
+            connection=connection,
+            template="PARTITION BY %(expressions)s",
+        )
+        window_sql.append(sql_expr)
+        window_params += tuple(sql_params)
+
+    if self.order_by is not None:
+        order_sql, order_params = compiler.compile(self.order_by)
+        window_sql.append(order_sql)
+        window_params += tuple(order_params)
+    else:
+        # MSSQL window functions require an OVER clause with ORDER BY
+        window_sql.append('ORDER BY (SELECT NULL)')
+
+    if self.frame:
+        frame_sql, frame_params = compiler.compile(self.frame)
+        window_sql.append(frame_sql)
+        window_params += tuple(frame_params)
+
+    template = template or self.template
+
+    return (
+        template % {"expression": expr_sql, "window": " ".join(window_sql).strip()},
+        (*params, *window_params),
+    )
 
 def _cursor_iter(cursor, sentinel, col_count, itersize):
     """
@@ -192,13 +230,31 @@ class SQLCompiler(compiler.SQLCompiler):
                 if not getattr(features, 'supports_select_{}'.format(combinator)):
                     raise NotSupportedError('{} is not supported on this database backend.'.format(combinator))
                 result, params = self.get_combinator_sql(combinator, self.query.combinator_all)
+            elif django.VERSION >= (4, 2) and self.qualify:
+                result, params = self.get_qualify_sql()
+                order_by = None
             else:
                 distinct_fields, distinct_params = self.get_distinct()
                 # This must come after 'select', 'ordering', and 'distinct' -- see
                 # docstring of get_from_clause() for details.
                 from_, f_params = self.get_from_clause()
-                where, w_params = self.compile(self.where) if self.where is not None else ("", [])
-                having, h_params = self.compile(self.having) if self.having is not None else ("", [])
+                if django.VERSION >= (4, 2):
+                    try:
+                        where, w_params = self.compile(self.where) if self.where is not None else ("", [])
+                    except EmptyResultSet:
+                        if self.elide_empty:
+                            raise
+                        # Use a predicate that's always False.
+                        where, w_params = "0 = 1", []
+                    except FullResultSet:
+                        where, w_params = "", []
+                    try:
+                        having, h_params = self.compile(self.having) if self.having is not None else ("", [])
+                    except FullResultSet:
+                        having, h_params = "", []
+                else:
+                    where, w_params = self.compile(self.where) if self.where is not None else ("", [])
+                    having, h_params = self.compile(self.having) if self.having is not None else ("", [])
                 params = []
                 result = ['SELECT']
 
@@ -281,7 +337,9 @@ class SQLCompiler(compiler.SQLCompiler):
                 if for_update_part and self.connection.features.for_update_after_from:
                     from_.insert(1, for_update_part)
 
-                result += [', '.join(out_cols), 'FROM', *from_]
+                result += [', '.join(out_cols)]
+                if from_:
+                    result += ['FROM', *from_]
                 params.extend(f_params)
 
                 if where:
@@ -327,7 +385,7 @@ class SQLCompiler(compiler.SQLCompiler):
                 # Django 2.x.  See https://github.com/microsoft/mssql-django/issues/12
                 # Add OFFSET for all Django versions.
                 # https://github.com/microsoft/mssql-django/issues/109
-                if not (do_offset or do_limit):
+                if not (do_offset or do_limit) and supports_offset_clause:
                     result.append("OFFSET 0 ROWS")
 
             # SQL Server requires the backend-specific emulation (2008 or earlier)
@@ -385,7 +443,45 @@ class SQLCompiler(compiler.SQLCompiler):
 
     def collapse_group_by(self, expressions, having):
         expressions = super().collapse_group_by(expressions, having)
-        return [e for e in expressions if not isinstance(e, Subquery)]
+        # SQL server does not allow subqueries or constant expressions in the group by
+        # For constants: Each GROUP BY expression must contain at least one column that is not an outer reference.
+        # For subqueries: Cannot use an aggregate or a subquery in an expression used for the group by list of a GROUP BY clause.
+        return self._filter_subquery_and_constant_expressions(expressions)
+
+    def _is_constant_expression(self, expression):
+        if isinstance(expression, Value):
+            return True
+        sub_exprs = expression.get_source_expressions()
+        if not sub_exprs:
+            return False
+        for each in sub_exprs:
+            if not self._is_constant_expression(each):
+                return False
+        return True
+
+
+
+    def _filter_subquery_and_constant_expressions(self, expressions):
+        ret = []
+        for expression in expressions:
+            if self._is_subquery(expression):
+                continue
+            if self._is_constant_expression(expression):
+                continue
+            if not self._has_nested_subquery(expression):
+                ret.append(expression)
+        return ret
+
+    def _has_nested_subquery(self, expression):
+        if self._is_subquery(expression):
+            return True
+        for sub_expr in expression.get_source_expressions():
+            if self._has_nested_subquery(sub_expr):
+                return True
+        return False
+
+    def _is_subquery(self, expression):
+        return isinstance(expression, Subquery)
 
     def _as_microsoft(self, node):
         as_microsoft = None
@@ -422,6 +518,9 @@ class SQLCompiler(compiler.SQLCompiler):
         if django.VERSION >= (3, 1):
             if isinstance(node, json_KeyTransform):
                 as_microsoft = _as_sql_json_keytransform
+        if django.VERSION >= (4, 1):
+            if isinstance(node, Window):
+                as_microsoft = _as_sql_window
         if as_microsoft:
             node = node.copy()
             node.as_microsoft = types.MethodType(as_microsoft, node)
